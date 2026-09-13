@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <title>GLB Viewer with File Camera, Bones & Raycast Collision</title>
+ <style>
+ body {
+ margin: 0;
+ padding: 0;
+ overflow: hidden;
+ font-family: sans-serif;
+ background-color: #1a1a1a;
+ color: #fff;
+ user-select: none;
+ -webkit-user-select: none;
+ -ms-user-select: none;
+ }
+ #menu {
+ position: absolute;
+ top: 20px;
+ left: 20px;
+ z-index: 10;
+ background: rgba(0, 0, 0, 0.75);
+ padding: 15px;
+ border-radius: 8px;
+ box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+ width: 290px;
+ }
+ #menu h3 {
+ margin-top: 0;
+ font-size: 16px;
+ margin-bottom: 10px;
+ }
+ .control-group {
+ margin-bottom: 12px;
+ }
+ .control-group label {
+ display: block;
+ font-size: 12px;
+ margin-bottom: 4px;
+ color: #ddd;
+ }
+ .info-text {
+ font-size: 11px;
+ color: #aaa;
+ margin-top: 5px;
+ line-height: 1.4;
+ }
+ input[type="file"] {
+ width: 100%;
+ font-size: 12px;
+ }
+ input[type="range"] {
+ width: 100%;
+ }
+ #canvas-container {
+ width: 100vw;
+ height: 100vh;
+ cursor: grab;
+ touch-action: none;
+ }
+ #canvas-container:active {
+ cursor: grabbing;
+ }
+ </style>
+</head>
+<body>
+
+ <div id="menu">
+ <h3>GLB Viewer & Water</h3>
+ <div class="control-group">
+ <label>モデル選択 (.zip)</label>
+ <input type="file" id="fileInput" accept=".zip">
+ </div>
+ <div class="control-group">
+ <label>波の高さ (<span id="waveHeightVal">5.0</span>)</label>
+ <input type="range" id="waveHeightRange" min="0" max="20" step="0.1" value="5.0">
+ </div>
+ <hr style="border:0; border-top:1px solid #444; margin:10px 0;">
+ <div class="control-group">
+ <label>操作方法</label>
+ <div class="info-text">
+ • <b>[C]キー</b>: カメラ切り替え<br>
+ • <b>[V]キー</b>: PerspectiveCamera_2に切り替え (航海モード)<br>
+ • <b>[N]キー</b>: PerspectiveCamera_4に切り替え & ボート操作<br>
+ • <b>[M]キー</b>: PerspectiveCamera_6に切り替え & ボート2操作<br>
+ • <b>[WASD]キー</b>: カメラ移動 / 船の航海操作（独立時のみ）<br>
+ • <b>画面ドラッグ</b>: 視点回転<br>
+ • <b>[1]キー</b>: 旋回 / 仰角操作モード<br>
+ • <b>[2]キー</b>: クレーン_1_1 / クレーン_2操作モード<br>
+ • <b>[3]キー</b>: クレーン / ワイヤー1操作モード<br>
+ • <b>[4]キー</b>: クレーン_1 / ワイヤー1_1操作モード<br>
+ • <b>[5]キー</b>: クレーン_1_2 / クレーン_2_1操作モード<br>
+ • <b>[Q/E] / [R/F]</b>: 各モードのボーン操作 (慣性付き)<br>
+ • <b>[G]キー</b>: 最も近いボートの接触判定・子要素化切替
+ </div>
+ </div>
+ </div>
+
+ <div id="canvas-container"></div>
+
+ <!-- Import Map を使って Three.js とアドオンを読み込む -->
+ <script type="importmap">
+ {
+ "imports": {
+ "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+ "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+ }
+ }
+ </script>
+
+ <script type="module">
+ import * as THREE from 'three';
+ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+ import { Water } from 'three/addons/objects/Water.js';
+ import { Sky } from 'three/addons/objects/Sky.js';
+ import { unzipSync } from 'https://unpkg.com/fflate@0.8.0/esm/browser.js';
+
+ let scene, renderer, controls;
+ let freeCamera, activeCamera; 
+ let fileCamera = null; 
+ let fileCamera2 = null; // PerspectiveCamera_2用
+ let boatCameras = {}; // ボート用カメラ保持
+ let originalCameraParent = null;
+ let originalCamera2Parent = null; // PerspectiveCamera_2元の親用
+ let currentModel;
+ let water, sun;
+ let waterGeometry;
+ let sky, directionalLight, ambientLight;
+
+ let playerMesh = null; // 生成される人型メッシュ
+
+ let colliders = [];
+ let raycaster = new THREE.Raycaster();
+
+ // レーダーメッシュ保持用配列
+ let radarMeshes = [];
+
+ // ボート専用の物理・状態管理
+ let boatsData = []; // { name, object, originalParent, isAttached, physics, navState, camera }
+ let npcShips = []; // NPC艦管理用
+
+ const waveParams = {
+ height: 5.0,
+ currentHeight: 5.0,
+ speed: 0.4,
+ frequency: 0.015
+ };
+
+ const shipPhysics = {
+ velocityY: 0,
+ velocitySlideX: 0,
+ velocitySlideZ: 0,
+ rotationVelocityX: 0,
+ rotationVelocityZ: 0
+ };
+
+ const cameraPhysics = {
+ velocityY: 0,
+ gravity: 0.01
+ };
+
+ let isFileCameraActive = false;
+ let isNavigationCameraActive = false; // PerspectiveCamera_2アクティブフラグ
+ let activeBoatKey = null; // 現在操作中のボート名 ('ボート' または 'ボート2')
+
+ // 航海モード用パラメータ
+ const navState = {
+ speed: 0,
+ maxSpeed: 0.35,
+ acceleration: 0.002,
+ deceleration: 0.003,
+ turnSpeed: 0.0,
+ maxTurnSpeed: 0.015,
+ turnRadius: 150.644,
+ heading: 0
+ };
+
+ const keys = { w: false, a: false, s: false, d: false, q: false, e: false, r: false, f: false };
+ let activeModes = { 1: false, 2: false, 3: false, 4: false, 5: false };
+
+ // ボーン参照および慣性用 velocity マップ
+ let bones = {};
+ let boneVelocities = {};
+
+ let isDragging = false;
+ let previousMousePosition = { x: 0, y: 0 };
+ let cameraRotation = { pitch: 0, yaw: 0 };
+
+ function init() {
+ const container = document.getElementById('canvas-container');
+
+ scene = new THREE.Scene();
+
+ freeCamera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100000);
+ activeCamera = freeCamera;
+
+ renderer = new THREE.WebGLRenderer({ antialias: true });
+ renderer.setSize(window.innerWidth, window.innerHeight);
+ renderer.setPixelRatio(window.devicePixelRatio);
+ renderer.shadowMap.enabled = true;
+ renderer.toneMapping = THREE.ACESFilmicToneMapping;
+ renderer.toneMappingExposure = 1.0;
+ renderer.logarithmicDepthBuffer = false;
+ container.appendChild(renderer.domElement);
+
+ controls = new OrbitControls(freeCamera, renderer.domElement);
+ controls.enableDamping = true;
+ controls.minDistance = 0.5;
+ controls.maxDistance = 25000;
+
+ sun = new THREE.Vector3();
+ directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+ directionalLight.castShadow = true;
+ scene.add(directionalLight);
+
+ ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+ scene.add(ambientLight);
+
+ sky = new Sky();
+ sky.scale.setScalar(100000);
+ scene.add(sky);
+
+ const skyUniforms = sky.material.uniforms;
+ skyUniforms['turbidity'].value = 10;
+ skyUniforms['rayleigh'].value = 2;
+ skyUniforms['mieCoefficient'].value = 0.005;
+ skyUniforms['mieDirectionalG'].value = 0.8;
+
+ const elevation = 20;
+ const azimuth = 180;
+ const phi = THREE.MathUtils.degToRad(90 - elevation);
+ const theta = THREE.MathUtils.degToRad(azimuth);
+ sun.setFromSphericalCoords(1, phi, theta);
+
+ sky.material.uniforms['sunPosition'].value.copy(sun);
+ directionalLight.position.copy(sun).multiplyScalar(1000);
+
+ waterGeometry = new THREE.PlaneGeometry(20000, 20000, 128, 128);
+ water = new Water(
+ waterGeometry,
+ {
+ textureWidth: 512,
+ textureHeight: 512,
+ waterNormals: new THREE.TextureLoader().load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/waternormals.jpg', (texture) => {
+ texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+ }),
+ sunDirection: sun.clone().normalize(),
+ sunColor: 0xffffff,
+ waterColor: 0x001e0f,
+ distortionScale: 3.7,
+ fog: scene.fog !== undefined
+ }
+ );
+ water.rotation.x = -Math.PI / 2;
+ water.position.y = 0;
+ scene.add(water);
+
+ const waveHeightRange = document.getElementById('waveHeightRange');
+ const waveHeightVal = document.getElementById('waveHeightVal');
+ waveHeightRange.addEventListener('input', (e) => {
+ const val = parseFloat(e.target.value);
+ waveParams.height = val;
+ waveHeightVal.textContent = val.toFixed(1);
+ });
+
+ window.addEventListener('keydown', (e) => {
+ if (e.key === 'c' || e.key === 'C') {
+ toggleCamera();
+ }
+ if (e.key === 'v' || e.key === 'V') {
+ toggleNavigationCamera();
+ }
+ if (e.key === 'n' || e.key === 'N') {
+ toggleSpecificBoatCamera('ボート', 'PerspectiveCamera_4');
+ }
+ if (e.key === 'm' || e.key === 'M') {
+ toggleSpecificBoatCamera('ボート2', 'PerspectiveCamera_6');
+ }
+ if (e.key === 'g' || e.key === 'G') {
+ toggleBoxAttachment();
+ }
+ if (e.key === '1') {
+ activeModes[1] = !activeModes[1];
+ if (activeModes[1]) {
+ if (bones['旋回']) boneVelocities['旋回'] = { rotX: 0, rotY: 0, rotZ: 0, posX: 0, posY: 0, posZ: 0 };
+ if (bones['仰角']) boneVelocities['仰角'] = { rotX: 0, rotY: 0, rotZ: 0, posX: 0, posY: 0, posZ: 0 };
+ }
+ }
+ if (e.key === '2') activeModes[2] = !activeModes[2];
+ if (e.key === '3') activeModes[3] = !activeModes[3];
+ if (e.key === '4') activeModes[4] = !activeModes[4];
+ if (e.key === '5') activeModes[5] = !activeModes[5];
+
+ if (e.key === 'w' || e.key === 'W') keys.w = true;
+ if (e.key === 'a' || e.key === 'A') keys.a = true;
+ if (e.key === 's' || e.key === 'S') keys.s = true;
+ if (e.key === 'd' || e.key === 'D') keys.d = true;
+ if (e.key === 'q' || e.key === 'Q') keys.q = true;
+ if (e.key === 'e' || e.key === 'E') keys.e = true;
+ if (e.key === 'r' || e.key === 'R') keys.r = true;
+ if (e.key === 'f' || e.key === 'F') keys.f = true;
+ });
+
+ window.addEventListener('keyup', (e) => {
+ if (e.key === 'w' || e.key === 'W') keys.w = false;
+ if (e.key === 'a' || e.key === 'A') keys.a = false;
+ if (e.key === 's' || e.key === 'S') keys.s = false;
+ if (e.key === 'd' || e.key === 'D') keys.d = false;
+ if (e.key === 'q' || e.key === 'Q') keys.q = false;
+ if (e.key === 'e' || e.key === 'E') keys.e = false;
+ if (e.key === 'r' || e.key === 'R') keys.r = false;
+ if (e.key === 'f' || e.key === 'F') keys.f = false;
+ });
+
+ renderer.domElement.addEventListener('pointerdown', (e) => {
+ if (isFileCameraActive || isNavigationCameraActive || activeBoatKey || e.button === 0) {
+ isDragging = true;
+ previousMousePosition = { x: e.clientX, y: e.clientY };
+ }
+ });
+
+ renderer.domElement.addEventListener('pointermove', (e) => {
+ if (isDragging) {
+ const deltaX = e.clientX - previousMousePosition.x;
+ const deltaY = e.clientY - previousMousePosition.y;
+
+ if (isFileCameraActive || isNavigationCameraActive || activeBoatKey) {
+ cameraRotation.yaw -= deltaX * 0.003;
+ cameraRotation.pitch -= deltaY * 0.003;
+ cameraRotation.pitch = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, cameraRotation.pitch));
+ }
+
+ previousMousePosition = { x: e.clientX, y: e.clientY };
+ }
+ });
+
+ window.addEventListener('pointerup', () => {
+ isDragging = false;
+ });
+
+ window.addEventListener('resize', onWindowResize);
+
+ const fileInput = document.getElementById('fileInput');
+ fileInput.addEventListener('change', async (e) => {
+ const file = e.target.files[0];
+ if (!file) return;
+
+ const buffer = await file.arrayBuffer();
+ const unzipped = unzipSync(new Uint8Array(buffer));
+ const files = {};
+
+ for (const filename in unzipped) {
+ files[filename] = unzipped[filename];
+ }
+
+ let taigaPath = '';
+ for (const filename in files) {
+ if (filename.toLowerCase().endsWith('taiga.glb')) {
+ taigaPath = filename;
+ break;
+ }
+ }
+
+ if (!taigaPath) {
+ alert('ZIP内に TAIGA.glb が見つかりません。');
+ return;
+ }
+
+ const taigaBlob = new Blob([files[taigaPath].buffer]);
+ const taigaUrl = URL.createObjectURL(taigaBlob);
+
+ const loader = new GLTFLoader();
+ loader.load(taigaUrl, (gltf) => {
+ if (currentModel) {
+ scene.remove(currentModel);
+ colliders = [];
+ fileCamera = null;
+ fileCamera2 = null;
+ originalCamera2Parent = null;
+ playerMesh = null;
+ bones = {};
+ boneVelocities = {};
+ boatsData = [];
+ boatCameras = {};
+ radarMeshes = [];
+ activeBoatKey = null;
+ npcShips = [];
+ }
+
+ currentModel = gltf.scene;
+ scene.add(currentModel);
+
+ currentModel.traverse((child) => {
+ if (child.name === 'レーダー' || child.name === 'レーダー_1' || child.name === 'レーダー_2') {
+ radarMeshes.push(child);
+ }
+ if (child.isMesh) {
+ colliders.push(child);
+ child.frustumCulled = false;
+ if (child.material) {
+ if (Array.isArray(child.material)) {
+ child.material.forEach(m => {
+ m.polygonOffset = false;
+ m.side = THREE.DoubleSide;
+ m.needsUpdate = true;
+ });
+ } else {
+ child.material.polygonOffset = false;
+ child.material.side = THREE.DoubleSide;
+ child.material.needsUpdate = true;
+ }
+ }
+ }
+ if (child.isBone || child.isObject3D) {
+ bones[child.name] = child;
+ boneVelocities[child.name] = { rotX: 0, rotY: 0, rotZ: 0, posX: 0, posY: 0, posZ: 0 };
+ if (child.name === 'PerspectiveCamera_2') {
+ fileCamera2 = child;
+ originalCamera2Parent = child.parent;
+ }
+ if (child.name === 'PerspectiveCamera_4' || child.name === 'PerspectiveCamera_6') {
+ boatCameras[child.name] = child;
+ }
+ }
+ });
+
+ let empty6MeshForInit = null;
+ currentModel.traverse((child) => {
+ if (child.name === 'empty_6' && !empty6MeshForInit) {
+ empty6MeshForInit = child;
+ }
+ });
+
+ currentModel.updateMatrixWorld(true);
+
+ ['ボート', 'ボート2'].forEach(boatName => {
+ let boatObj = null;
+ currentModel.traverse((child) => {
+ if (child.name === boatName && !boatObj) {
+ boatObj = child;
+ }
+ });
+
+ if (boatObj) {
+ boatObj.traverse((subChild) => {
+ if (subChild.isMesh && !colliders.includes(subChild)) {
+ colliders.push(subChild);
+ subChild.frustumCulled = false;
+ if (subChild.material) {
+ if (Array.isArray(subChild.material)) {
+ subChild.material.forEach(m => {
+ m.polygonOffset = false;
+ m.side = THREE.DoubleSide;
+ m.needsUpdate = true;
+ });
+ } else {
+ subChild.material.polygonOffset = false;
+ subChild.material.side = THREE.DoubleSide;
+ subChild.material.needsUpdate = true;
+ }
+ }
+ }
+ });
+
+ const initialLocalScale = boatObj.scale.clone();
+
+ let isInitiallyTouching = false;
+ if (empty6MeshForInit) {
+ boatObj.updateMatrixWorld(true);
+ empty6MeshForInit.updateMatrixWorld(true);
+ const boatBox = new THREE.Box3().setFromObject(boatObj);
+ boatBox.expandByScalar(-0.1);
+ const empty6Box = new THREE.Box3().setFromObject(empty6MeshForInit);
+ if (boatBox.intersectsBox(empty6Box)) {
+ isInitiallyTouching = true;
+ }
+ }
+
+ if (isInitiallyTouching && empty6MeshForInit) {
+ const worldPos = new THREE.Vector3();
+ const worldQuat = new THREE.Quaternion();
+ boatObj.getWorldPosition(worldPos);
+ boatObj.getWorldQuaternion(worldQuat);
+
+ empty6MeshForInit.attach(boatObj);
+ empty6MeshForInit.updateMatrixWorld(true);
+ const inverseParentMatrix = new THREE.Matrix4().copy(boatObj.parent.matrixWorld).invert();
+ const targetWorldMatrix = new THREE.Matrix4().compose(worldPos, worldQuat, initialLocalScale);
+ const localMatrix = targetWorldMatrix.premultiply(inverseParentMatrix);
+ localMatrix.decompose(boatObj.position, boatObj.quaternion, boatObj.scale);
+ boatObj.updateMatrixWorld(true);
+ }
+
+ let camName = boatName === 'ボート' ? 'PerspectiveCamera_4' : 'PerspectiveCamera_6';
+ boatsData.push({
+ name: boatName,
+ object: boatObj,
+ originalParent: boatObj.parent,
+ isAttached: isInitiallyTouching,
+ initialLocalScale: initialLocalScale,
+ camera: boatCameras[camName] || null,
+ physics: { velocityY: 0, velocitySlideX: 0, velocitySlideZ: 0, rotationVelocityX: 0, rotationVelocityZ: 0 },
+ navState: { speed: 0, maxSpeed: 0.7, acceleration: 0.004, deceleration: 0.006, turnSpeed: 0.0, maxTurnSpeed: 0.015, turnRadius: 12, heading: 0 }
+ });
+ }
+ });
+
+ createPlayerMesh();
+ currentModel.add(playerMesh);
+ playerMesh.visible = true;
+
+ if (gltf.cameras && gltf.cameras.length > 0) {
+ fileCamera = gltf.cameras[0];
+ } else {
+ gltf.scene.traverse((child) => {
+ if (child.isPerspectiveCamera && !fileCamera) {
+ fileCamera = child;
+ }
+ });
+ }
+
+ if (fileCamera) {
+ originalCameraParent = fileCamera.parent;
+ fileCamera.aspect = window.innerWidth / window.innerHeight;
+ fileCamera.near = 0.1;
+ fileCamera.far = 100000;
+ fileCamera.updateProjectionMatrix();
+ }
+
+ if (fileCamera2) {
+ fileCamera2.aspect = window.innerWidth / window.innerHeight;
+ fileCamera2.near = 0.1;
+ fileCamera2.far = 100000;
+ fileCamera2.updateProjectionMatrix();
+ }
+
+ freeCamera.near = 0.1;
+ freeCamera.far = 100000;
+ freeCamera.updateProjectionMatrix();
+
+ const box = new THREE.Box3().setFromObject(currentModel);
+ const center = box.getCenter(new THREE.Vector3());
+ const size = box.getSize(new THREE.Vector3());
+
+ currentModel.position.set(-center.x, -box.min.y, -center.z);
+ navState.heading = currentModel.rotation.y;
+
+ shipPhysics.velocityY = 0;
+ shipPhysics.velocitySlideX = 0;
+ shipPhysics.velocitySlideZ = 0;
+ shipPhysics.rotationVelocityX = 0;
+ shipPhysics.rotationVelocityZ = 0;
+
+ const maxDim = Math.max(size.x, size.y, size.z);
+ freeCamera.position.set(0, center.y + maxDim * 0.5, maxDim * 2.0);
+ controls.target.set(0, center.y, 0);
+ controls.update();
+
+ const npcTargetNames = ['コンテナ船.glb', 'LNG.glb', '小型船.glb', '貨物船.glb', '工作船.glb'];
+ for (const filename in files) {
+ const lowerName = filename.toLowerCase();
+ if (npcTargetNames.some(n => lowerName.endsWith(n.toLowerCase()))) {
+ const npcBlob = new Blob([files[filename].buffer]);
+ const npcUrl = URL.createObjectURL(npcBlob);
+ loader.load(npcUrl, (npcGltf) => {
+ const npcObj = npcGltf.scene;
+ npcObj.position.set((Math.random() - 0.5) * 8000, 0, (Math.random() - 0.5) * 8000);
+ scene.add(npcObj);
+
+ let turnRad = 50;
+ if (lowerName.includes('工作船')) {
+ turnRad = 12;
+ }
+
+ npcShips.push({
+ object: npcObj,
+ speed: 0.15 + Math.random() * 0.1,
+ heading: Math.random() * Math.PI * 2,
+ targetHeading: Math.random() * Math.PI * 2,
+ turnRadius: turnRad,
+ physics: { velocityY: 0, rotationVelocityX: 0, rotationVelocityZ: 0 }
+ });
+ });
+ }
+ }
+
+ });
+ });
+
+ animate();
+ }
+
+ function createPlayerMesh() {
+ if (playerMesh) return;
+ 
+ const group = new THREE.Group();
+ const mat = new THREE.MeshStandardMaterial({ color: 0x3366cc, roughness: 0.5 });
+ const skinMat = new THREE.MeshStandardMaterial({ color: 0xffcc99, roughness: 0.5 });
+
+ const head = new THREE.Mesh(new THREE.SphereGeometry(0.18, 16, 16), skinMat);
+ head.position.y = 1.45;
+ head.castShadow = true;
+ group.add(head);
+
+ const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.16, 0.6, 16), mat);
+ torso.position.y = 1.05;
+ torso.castShadow = true;
+ group.add(torso);
+
+ const hips = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.2, 16), mat);
+ hips.position.y = 0.7;
+ hips.castShadow = true;
+ group.add(hips);
+
+ const armGeo = new THREE.CylinderGeometry(0.07, 0.05, 0.55, 8);
+ const leftArm = new THREE.Mesh(armGeo, mat);
+ leftArm.position.set(-0.3, 1.05, 0);
+ leftArm.castShadow = true;
+ group.add(leftArm);
+
+ const rightArm = new THREE.Mesh(armGeo, mat);
+ rightArm.position.set(0.3, 1.05, 0);
+ rightArm.castShadow = true;
+ group.add(rightArm);
+
+ const legGeo = new THREE.CylinderGeometry(0.08, 0.06, 0.7, 8);
+ const leftLeg = new THREE.Mesh(legGeo, mat);
+ leftLeg.position.set(-0.12, 0.35, 0);
+ leftLeg.castShadow = true;
+ group.add(leftLeg);
+
+ const rightLeg = new THREE.Mesh(legGeo, mat);
+ rightLeg.position.set(0.12, 0.35, 0);
+ rightLeg.castShadow = true;
+ group.add(rightLeg);
+
+ playerMesh = group;
+ }
+
+ function toggleCamera() {
+ if (!fileCamera) {
+ console.warn("GLBファイル内にカメラが見つかりません。");
+ return;
+ }
+
+ if (isNavigationCameraActive) {
+ isNavigationCameraActive = false;
+ if (fileCamera2 && originalCamera2Parent) {
+ originalCamera2Parent.attach(fileCamera2);
+ }
+ }
+ if (activeBoatKey) {
+ const currentBoat = boatsData.find(b => b.name === activeBoatKey);
+ if (currentBoat && currentBoat.camera) {
+ currentBoat.camera.parent.attach(currentBoat.camera);
+ }
+ activeBoatKey = null;
+ }
+
+ isFileCameraActive = !isFileCameraActive;
+ if (isFileCameraActive) {
+ if (originalCameraParent && originalCameraParent !== currentModel) {
+ currentModel.attach(fileCamera);
+ }
+
+ createPlayerMesh();
+ if (playerMesh.parent !== currentModel) {
+ currentModel.add(playerMesh);
+ }
+ playerMesh.visible = true;
+ playerMesh.position.copy(fileCamera.position);
+ playerMesh.position.y -= 1.688;
+
+ activeCamera = fileCamera;
+ controls.enabled = false;
+ 
+ const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+ euler.setFromQuaternion(fileCamera.quaternion);
+ cameraRotation.yaw = euler.y;
+ cameraRotation.pitch = euler.x;
+ cameraPhysics.velocityY = 0;
+ } else {
+ activeCamera = freeCamera;
+ controls.enabled = true;
+ if (playerMesh) {
+ playerMesh.visible = true;
+ }
+ }
+ }
+
+ function toggleNavigationCamera() {
+ if (!fileCamera2) {
+ console.warn("PerspectiveCamera_2 が見つかりません。");
+ return;
+ }
+
+ if (isFileCameraActive) {
+ isFileCameraActive = false;
+ }
+ if (activeBoatKey) {
+ const currentBoat = boatsData.find(b => b.name === activeBoatKey);
+ if (currentBoat && currentBoat.camera) {
+ currentBoat.camera.parent.attach(currentBoat.camera);
+ }
+ activeBoatKey = null;
+ }
+
+ isNavigationCameraActive = !isNavigationCameraActive;
+ if (isNavigationCameraActive) {
+ if (currentModel) {
+ currentModel.attach(fileCamera2);
+ }
+
+ if (playerMesh) {
+ playerMesh.visible = true;
+ }
+
+ activeCamera = fileCamera2;
+ controls.enabled = false;
+
+ const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+ euler.setFromQuaternion(fileCamera2.quaternion);
+ cameraRotation.yaw = euler.y;
+ cameraRotation.pitch = euler.x;
+ } else {
+ if (originalCamera2Parent) {
+ originalCamera2Parent.attach(fileCamera2);
+ }
+ activeCamera = freeCamera;
+ controls.enabled = true;
+ if (playerMesh) {
+ playerMesh.visible = true;
+ }
+ }
+ }
+
+ function toggleSpecificBoatCamera(boatName, cameraName) {
+ const targetBoat = boatsData.find(b => b.name === boatName);
+ const targetCam = boatCameras[cameraName];
+
+ if (!targetBoat || !targetCam) {
+ console.warn(`対象のボート (${boatName}) またはカメラ (${cameraName}) が見つかりません。`);
+ return;
+}
+
+ if (isFileCameraActive) isFileCameraActive = false;
+ if (isNavigationCameraActive) {
+ isNavigationCameraActive = false;
+ if (fileCamera2 && originalCamera2Parent) originalCamera2Parent.attach(fileCamera2);
+ }
+
+ if (activeBoatKey === boatName) {
+ targetCam.parent.attach(targetCam);
+ activeBoatKey = null;
+ activeCamera = freeCamera;
+ controls.enabled = true;
+ } else {
+ if (activeBoatKey) {
+ const prevBoat = boatsData.find(b => b.name === activeBoatKey);
+ if (prevBoat && prevBoat.camera) {
+ prevBoat.camera.parent.attach(prevBoat.camera);
+ }
+ }
+
+ activeBoatKey = boatName;
+ activeCamera = targetCam;
+ controls.enabled = false;
+
+ const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+ euler.setFromQuaternion(targetCam.quaternion);
+ cameraRotation.yaw = euler.y;
+ cameraRotation.pitch = euler.x;
+ }
+ }
+
+ function toggleBoxAttachment() {
+ let empty6Mesh = null;
+ currentModel.traverse((child) => {
+ if (child.name === 'empty_6' && !empty6Mesh) {
+ empty6Mesh = child;
+ }
+ });
+
+ currentModel.updateMatrixWorld(true);
+
+ let targetBoatData = null;
+ if (activeBoatKey) {
+ targetBoatData = boatsData.find(b => b.name === activeBoatKey);
+ } else {
+ let minDist = Infinity;
+ boatsData.forEach(b => {
+ const bWorldPos = new THREE.Vector3();
+ b.object.getWorldPosition(bWorldPos);
+ const dist = bWorldPos.distanceTo(activeCamera.position);
+ if (dist < minDist) {
+ minDist = dist;
+ targetBoatData = b;
+ }
+ });
+ }
+
+ if (!targetBoatData) return;
+
+ let boatObj = targetBoatData.object;
+ boatObj.updateMatrixWorld(true);
+ let boatBounding = new THREE.Box3().setFromObject(boatObj);
+ boatBounding.expandByScalar(-0.1);
+ 
+ let isTouchingEmpty6 = false;
+ if (empty6Mesh) {
+ empty6Mesh.updateMatrixWorld(true);
+ const empty6Box = new THREE.Box3().setFromObject(empty6Mesh);
+ if (boatBounding.intersectsBox(empty6Box)) {
+ isTouchingEmpty6 = true;
+ }
+ }
+
+ let currentParentName = boatObj.parent ? boatObj.parent.name : '';
+ let isChildOfBox = ['Box1', 'Box2', 'Box3', 'Box4'].includes(currentParentName);
+
+ let targetParent = null;
+
+ if (isChildOfBox) {
+ if (empty6Mesh && isTouchingEmpty6) {
+ targetParent = empty6Mesh;
+ targetBoatData.isAttached = true;
+ } else {
+ targetParent = null;
+ targetBoatData.isAttached = false;
+ }
+ } else {
+ let touchedBox = null;
+ ['Box1', 'Box2', 'Box3', 'Box4'].forEach(bName => {
+ let boxMesh = null;
+ currentModel.traverse((child) => {
+ if (child.name === bName && !boxMesh) {
+ boxMesh = child;
+ }
+ });
+ if (boxMesh) {
+ boxMesh.updateMatrixWorld(true);
+ const boxBounding = new THREE.Box3().setFromObject(boxMesh);
+ boxBounding.expandByScalar(-0.1);
+ if (boatBounding.intersectsBox(boxBounding)) {
+ touchedBox = boxMesh;
+ }
+ }
+ });
+
+ if (touchedBox) {
+ targetParent = touchedBox;
+ targetBoatData.isAttached = true;
+ } else if (empty6Mesh && isTouchingEmpty6) {
+ targetParent = empty6Mesh;
+ targetBoatData.isAttached = true;
+ } else {
+ targetParent = null;
+ targetBoatData.isAttached = false;
+ }
+ }
+
+ const worldPos = new THREE.Vector3();
+ const worldQuat = new THREE.Quaternion();
+ boatObj.getWorldPosition(worldPos);
+ boatObj.getWorldQuaternion(worldQuat);
+
+ if (targetParent) {
+ targetParent.attach(boatObj);
+ } else {
+ scene.attach(boatObj);
+ }
+
+ boatObj.parent.updateMatrixWorld(true);
+
+ const inverseParentMatrix = new THREE.Matrix4().copy(boatObj.parent.matrixWorld).invert();
+ const targetWorldMatrix = new THREE.Matrix4().compose(worldPos, worldQuat, targetBoatData.initialLocalScale);
+ const localMatrix = targetWorldMatrix.premultiply(inverseParentMatrix);
+ localMatrix.decompose(boatObj.position, boatObj.quaternion, boatObj.scale);
+
+ if (['Box1', 'Box2', 'Box3', 'Box4'].includes(boatObj.parent ? boatObj.parent.name : '')) {
+ boatObj.rotation.set(0, 0, 0);
+ }
+
+ boatObj.updateMatrixWorld(true);
+ }
+
+ function calculateWaveHeight(x, y, time) {
+ const f = waveParams.frequency;
+ const h = waveParams.currentHeight;
+
+ const largeWave = Math.sin(x * f + time * 1.2) * Math.cos(y * f + time * 0.9);
+ const smallWave = Math.sin(x * (f * 3.0) - time * 2.5) * Math.cos(y * (f * 2.5) - time * 2.0) * 0.3;
+
+ return (largeWave + smallWave) * h;
+ }
+
+ function loadGLB(buffer) {
+ }
+
+ function onWindowResize() {
+ freeCamera.aspect = window.innerWidth / window.innerHeight;
+ freeCamera.updateProjectionMatrix();
+ if (fileCamera) {
+ fileCamera.aspect = window.innerWidth / window.innerHeight;
+ fileCamera.updateProjectionMatrix();
+ }
+ if (fileCamera2) {
+ fileCamera2.aspect = window.innerWidth / window.innerHeight;
+ fileCamera2.updateProjectionMatrix();
+ }
+ renderer.setSize(window.innerWidth, window.innerHeight);
+ }
+
+ const clock = new THREE.Clock();
+ let accumulatedTime = 0;
+
+ function animate() {
+ requestAnimationFrame(animate);
+
+ const delta = clock.getDelta();
+ accumulatedTime += delta * waveParams.speed;
+
+ const radarSpeed = (Math.PI * 2 / 6) * delta;
+ radarMeshes.forEach(mesh => {
+ mesh.rotation.y += radarSpeed;
+ });
+
+ const cycleTime = (clock.getElapsedTime() % 1440) / 1440 * Math.PI * 2;
+ const sunElevation = Math.sin(cycleTime) * 90; 
+ const sunAzimuth = (cycleTime / (Math.PI * 2)) * 360;
+ const phi = THREE.MathUtils.degToRad(90 - sunElevation);
+ const theta = THREE.MathUtils.degToRad(sunAzimuth);
+ sun.setFromSphericalCoords(1, phi, theta);
+ if (sky) sky.material.uniforms['sunPosition'].value.copy(sun);
+ if (directionalLight) {
+ directionalLight.position.copy(sun).multiplyScalar(1000);
+ const intensity = Math.max(0.1, Math.sin(cycleTime));
+ directionalLight.intensity = intensity * 1.5;
+ ambientLight.intensity = Math.max(0.2, intensity * 0.8);
+ }
+
+ waveParams.currentHeight += (waveParams.height - waveParams.currentHeight) * 0.05;
+
+ water.material.uniforms['time'].value += delta * waveParams.speed;
+
+ const positionAttribute = waterGeometry.attributes.position;
+ for (let i = 0; i < positionAttribute.count; i++) {
+ const x = positionAttribute.getX(i);
+ const y = positionAttribute.getY(i);
+ const z = calculateWaveHeight(x, y, accumulatedTime);
+ positionAttribute.setZ(i, z);
+ }
+ positionAttribute.needsUpdate = true;
+
+ const rotSpeed = 0.75 * delta;
+ const posSpeed = 1.0 * delta;
+ const dampingFactor = 0.88;
+
+ if (activeModes[1]) {
+ if (bones['旋回']) {
+ let targetRotYVal = 0;
+ if (keys.q) targetRotYVal += rotSpeed;
+ if (keys.e) targetRotYVal -= rotSpeed;
+ boneVelocities['旋回'].rotY += (targetRotYVal - boneVelocities['旋回'].rotY) * 0.1;
+ bones['旋回'].rotation.y += boneVelocities['旋回'].rotY;
+ }
+ if (bones['仰角']) {
+ let targetRotXVal = 0;
+ if (keys.r) targetRotXVal -= rotSpeed;
+ if (keys.f) targetRotXVal += rotSpeed;
+ boneVelocities['仰角'].rotX += (targetRotXVal - boneVelocities['仰角'].rotX) * 0.1;
+ bones['仰角'].rotation.x += boneVelocities['仰角'].rotX;
+ const minX = THREE.MathUtils.degToRad(-55);
+ const maxX = THREE.MathUtils.degToRad(20);
+ bones['仰角'].rotation.x = Math.max(minX, Math.min(maxX, bones['仰角'].rotation.x));
+ }
+ }
+ Object.keys(boneVelocities).forEach(name => {
+ boneVelocities[name].rotX *= dampingFactor;
+ boneVelocities[name].rotY *= dampingFactor;
+ boneVelocities[name].posX *= dampingFactor;
+ boneVelocities[name].posY *= dampingFactor;
+ });
+
+ if (activeModes[2]) {
+ if (bones['クレーン_1_1']) {
+ let targetPosX = 0;
+ if (keys.q) targetPosX += posSpeed;
+ if (keys.e) targetPosX -= posSpeed;
+ boneVelocities['クレーン_1_1'].posX += (targetPosX - boneVelocities['クレーン_1_1'].posX) * 0.1;
+ bones['クレーン_1_1'].position.x += boneVelocities['クレーン_1_1'].posX;
+ bones['クレーン_1_1'].position.x = Math.max(-7.284, Math.min(14.019, bones['クレーン_1_1'].position.x));
+ }
+ if (bones['クレーン_2']) {
+ let targetPosY = 0;
+ if (keys.r) targetPosY += posSpeed;
+ if (keys.f) targetPosY -= posSpeed;
+ boneVelocities['クレーン_2'].posY += (targetPosY - boneVelocities['クレーン_2'].posY) * 0.1;
+ bones['クレーン_2'].position.y += boneVelocities['クレーン_2'].posY;
+ bones['クレーン_2'].position.y = Math.max(-10.420, Math.min(0, bones['クレーン_2'].position.y));
+ }
+ }
+
+ if (activeModes[3]) {
+ if (bones['クレーン']) {
+ let targetPosX = 0;
+ if (keys.q) targetPosX += posSpeed;
+ if (keys.e) targetPosX -= posSpeed;
+ boneVelocities['クレーン'].posX += (targetPosX - boneVelocities['クレーン'].posX) * 0.1;
+ bones['クレーン'].position.x += boneVelocities['クレーン'].posX;
+ bones['クレーン'].position.x = Math.max(-1.434, Math.min(1.766, bones['クレーン'].position.x));
+ }
+ if (bones['ワイヤー1']) {
+ let targetPosY = 0;
+ if (keys.r) targetPosY += posSpeed;
+ if (keys.f) targetPosY -= posSpeed;
+ boneVelocities['ワイヤー1'].posY += (targetPosY - boneVelocities['ワイヤー1'].posY) * 0.1;
+ bones['ワイヤー1'].position.y += boneVelocities['ワイヤー1'].posY;
+ bones['ワイヤー1'].position.y = Math.max(-3.805, Math.min(-0.924, bones['ワイヤー1'].position.y));
+ }
+ }
+
+ if (activeModes[4]) {
+ if (bones['クレーン_1']) {
+ let targetPosX = 0;
+ if (keys.q) targetPosX += posSpeed;
+ if (keys.e) targetPosX -= posSpeed;
+ boneVelocities['クレーン_1'].posX += (targetPosX - boneVelocities['クレーン_1'].posX) * 0.1;
+ bones['クレーン_1'].position.x += boneVelocities['クレーン_1'].posX;
+ bones['クレーン_1'].position.x = Math.max(-1.434, Math.min(1.766, bones['クレーン_1'].position.x));
+ }
+ if (bones['ワイヤー1_1']) {
+ let targetPosY = 0;
+ if (keys.r) targetPosY += posSpeed;
+ if (keys.f) targetPosY -= posSpeed;
+ boneVelocities['ワイヤー1_1'].posY += (targetPosY - boneVelocities['ワイヤー1_1'].posY) * 0.1;
+ bones['ワイヤー1_1'].position.y += boneVelocities['ワイヤー1_1'].posY;
+ bones['ワイヤー1_1'].position.y = Math.max(-3.805, Math.min(-0.924, bones['ワイヤー1_1'].position.y));
+ }
+ }
+
+ if (activeModes[5]) {
+ if (bones['クレーン_1_2']) {
+ let targetPosZ = 0;
+ if (keys.q) targetPosZ += posSpeed;
+ if (keys.e) targetPosZ -= posSpeed;
+ boneVelocities['クレーン_1_2'].posZ += (targetPosZ - boneVelocities['クレーン_1_2'].posZ) * 0.1;
+ bones['クレーン_1_2'].position.z += boneVelocities['クレーン_1_2'].posZ;
+ bones['クレーン_1_2'].position.z = Math.max(25.215, Math.min(37.467, bones['クレーン_1_2'].position.z));
+ }
+ if (bones['クレーン_2_1']) {
+ let targetPosY = 0;
+ if (keys.r) targetPosY += posSpeed;
+ if (keys.f) targetPosY -= posSpeed;
+ boneVelocities['クレーン_2_1'].posY += (targetPosY - boneVelocities['クレーン_2_1'].posY) * 0.1;
+ bones['クレーン_2_1'].position.y += boneVelocities['クレーン_2_1'].posY;
+ bones['クレーン_2_1'].position.y = Math.max(-8.127, Math.min(0, bones['クレーン_2_1'].position.y));
+ }
+ }
+
+ for (let i = 0; i < npcShips.length; i++) {
+ const npc = npcShips[i];
+ 
+ if (Math.random() < 0.005) {
+ npc.targetHeading = Math.random() * Math.PI * 2;
+ }
+
+ let avoidAngle = 0;
+ for (let j = 0; j < npcShips.length; j++) {
+ if (i === j) continue;
+ const other = npcShips[j];
+ const dist = npc.object.position.distanceTo(other.object.position);
+ if (dist < 300) {
+ const toOther = new THREE.Vector3().subVectors(other.object.position, npc.object.position);
+ const forwardDir = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), npc.heading);
+ const cross = forwardDir.x * toOther.z - forwardDir.z * toOther.x;
+ avoidAngle += (cross > 0 ? -1 : 1) * Math.max(0, (300 - dist) / 300) * 0.01;
+ }
+ }
+
+ let desiredHeading = npc.targetHeading + avoidAngle;
+ let diff = desiredHeading - npc.heading;
+ diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+ 
+ const maxTurnStep = 0.003;
+ npc.heading += Math.max(-maxTurnStep, Math.min(maxTurnStep, diff * 0.05));
+
+ npc.object.rotation.y = npc.heading;
+ const moveDir = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), npc.heading);
+ npc.object.position.addScaledVector(moveDir, npc.speed);
+
+ const nX = npc.object.position.x;
+ const nZ = npc.object.position.z;
+ const targetWaveY = calculateWaveHeight(nX, nZ, accumulatedTime);
+
+ const stiffness = 0.05;
+ const damping = 0.92;
+
+ const force = (targetWaveY - npc.object.position.y) * stiffness;
+ npc.physics.velocityY += force;
+ npc.physics.velocityY *= damping;
+ npc.object.position.y += npc.physics.velocityY;
+
+ const offset = 5.0;
+ const heightFront = calculateWaveHeight(nX, nZ + offset, accumulatedTime);
+ const heightBack = calculateWaveHeight(nX, nZ - offset, accumulatedTime);
+ const heightLeft = calculateWaveHeight(nX - offset, nZ, accumulatedTime);
+ const heightRight = calculateWaveHeight(nX + offset, nZ, accumulatedTime);
+
+ const targetRotX = (heightFront - heightBack) * 0.05;
+ const targetRotZ = (heightLeft - heightRight) * 0.05;
+
+ npc.physics.rotationVelocityX += (targetRotX - npc.object.rotation.x) * 0.1;
+ npc.physics.rotationVelocityX *= 0.85;
+ npc.object.rotation.x += npc.physics.rotationVelocityX;
+
+ npc.physics.rotationVelocityZ += (targetRotZ - npc.object.rotation.z) * 0.1;
+ npc.physics.rotationVelocityZ *= 0.85;
+ npc.object.rotation.z += npc.physics.rotationVelocityZ;
+ }
+
+ boatsData.forEach(boatData => {
+ const boatObj = boatData.object;
+ 
+ let currentParentName = boatObj.parent ? boatObj.parent.name : '';
+ let isChild = currentParentName !== '' && currentParentName !== currentModel.name;
+
+ if (boatData.isAttached || isChild) {
+ boatData.navState.speed = 0;
+ return;
+ }
+
+ if (activeBoatKey === boatData.name) {
+ const bNav = boatData.navState;
+ if (keys.w) {
+ bNav.speed = Math.min(bNav.speed + bNav.acceleration, bNav.maxSpeed);
+ } else if (keys.s) {
+ bNav.speed = Math.max(bNav.speed - bNav.acceleration, -bNav.maxSpeed * 0.5);
+ } else {
+ if (bNav.speed > 0) bNav.speed = Math.max(0, bNav.speed - bNav.deceleration);
+ if (bNav.speed < 0) bNav.speed = Math.min(0, bNav.speed + bNav.deceleration);
+ }
+
+ if (keys.a && Math.abs(bNav.speed) > 0.001) {
+ bNav.turnSpeed = bNav.maxTurnSpeed;
+ bNav.heading += (bNav.speed / bNav.turnRadius) * (bNav.speed > 0 ? 1 : -1);
+ } else if (keys.d && Math.abs(bNav.speed) > 0.001) {
+ bNav.turnSpeed = -bNav.maxTurnSpeed;
+ bNav.heading -= (bNav.speed / bNav.turnRadius) * (bNav.speed > 0 ? 1 : -1);
+ } else {
+ bNav.turnSpeed = 0;
+ }
+
+ boatObj.rotation.y = bNav.heading;
+
+ const moveDir = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), bNav.heading);
+ boatObj.position.addScaledVector(moveDir, bNav.speed);
+ }
+
+ const bX = boatObj.position.x;
+ const bZ = boatObj.position.z;
+ const targetWaveY = calculateWaveHeight(bX, bZ, accumulatedTime);
+
+ const stiffness = 0.05;
+ const damping = 0.92;
+
+ const force = (targetWaveY - boatObj.position.y) * stiffness;
+ boatData.physics.velocityY += force;
+ boatData.physics.velocityY *= damping;
+ boatObj.position.y += boatData.physics.velocityY;
+
+ const offset = 5.0;
+ const heightFront = calculateWaveHeight(bX, bZ + offset, accumulatedTime);
+ const heightBack = calculateWaveHeight(bX, bZ - offset, accumulatedTime);
+ const heightLeft = calculateWaveHeight(bX - offset, bZ, accumulatedTime);
+ const heightRight = calculateWaveHeight(bX + offset, bZ, accumulatedTime);
+
+ const targetRotX = (heightFront - heightBack) * 0.05;
+ const targetRotZ = (heightLeft - heightRight) * 0.05;
+
+ boatData.physics.rotationVelocityX += (targetRotX - boatObj.rotation.x) * 0.1;
+ boatData.physics.rotationVelocityX *= 0.85;
+ boatObj.rotation.x += boatData.physics.rotationVelocityX;
+
+ boatData.physics.rotationVelocityZ += (targetRotZ - boatObj.rotation.z) * 0.1;
+ boatData.physics.rotationVelocityZ *= 0.85;
+ boatObj.rotation.z += boatData.physics.rotationVelocityZ;
+ });
+
+ if (activeBoatKey) {
+ const activeBoat = boatsData.find(b => b.name === activeBoatKey);
+ if (activeBoat && activeBoat.camera) {
+ activeBoat.camera.rotation.order = 'YXZ';
+ activeBoat.camera.rotation.y = cameraRotation.yaw;
+ activeBoat.camera.rotation.x = cameraRotation.pitch;
+ }
+ }
+
+ if (currentModel) {
+ if (isNavigationCameraActive && fileCamera2) {
+ if (keys.w) {
+ navState.speed = Math.min(navState.speed + navState.acceleration, navState.maxSpeed);
+ } else if (keys.s) {
+ navState.speed = Math.max(navState.speed - navState.acceleration, -navState.maxSpeed * 0.5);
+ } else {
+ if (navState.speed > 0) navState.speed = Math.max(0, navState.speed - navState.deceleration);
+ if (navState.speed < 0) navState.speed = Math.min(0, navState.speed + navState.deceleration);
+ }
+
+ if (keys.a && Math.abs(navState.speed) > 0.001) {
+ navState.turnSpeed = navState.maxTurnSpeed;
+ navState.heading += (navState.speed / navState.turnRadius) * (navState.speed > 0 ? 1 : -1);
+ } else if (keys.d && Math.abs(navState.speed) > 0.001) {
+ navState.turnSpeed = -navState.maxTurnSpeed;
+ navState.heading -= (navState.speed / navState.turnRadius) * (navState.speed > 0 ? 1 : -1);
+ } else {
+ navState.turnSpeed = 0;
+ }
+
+ currentModel.rotation.y = navState.heading;
+
+ const moveDir = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), navState.heading);
+ currentModel.position.addScaledVector(moveDir, navState.speed);
+ }
+
+ const shipX = currentModel.position.x;
+ const shipZ = currentModel.position.z;
+ 
+ const targetWaveY = calculateWaveHeight(shipX, shipZ, accumulatedTime);
+
+ const stiffness = 0.05; 
+ const damping = 0.92;   
+
+ const force = (targetWaveY - currentModel.position.y) * stiffness;
+ shipPhysics.velocityY += force;
+ shipPhysics.velocityY *= damping;
+ currentModel.position.y += shipPhysics.velocityY;
+
+ const offset = 5.0;
+ const heightFront = calculateWaveHeight(shipX, shipZ + offset, accumulatedTime);
+ const heightBack = calculateWaveHeight(shipX, shipZ - offset, accumulatedTime);
+ const heightLeft = calculateWaveHeight(shipX - offset, shipZ, accumulatedTime);
+ const heightRight = calculateWaveHeight(shipX + offset, shipZ, accumulatedTime);
+
+ const targetRotX = (heightFront - heightBack) * 0.05;
+ const targetRotZ = (heightLeft - heightRight) * 0.05;
+
+ const tiltMagnitude = Math.abs(targetRotX) + Math.abs(targetRotZ);
+ const slopeThreshold = 0.06;
+
+ if (tiltMagnitude > slopeThreshold) {
+ const slideForce = (tiltMagnitude - slopeThreshold) * 0.35;
+ shipPhysics.velocitySlideX += Math.sin(currentModel.rotation.z) * slideForce;
+ shipPhysics.velocitySlideZ += -Math.sin(currentModel.rotation.x) * slideForce;
+ }
+
+ shipPhysics.velocitySlideX *= 0.88;
+ shipPhysics.velocitySlideZ *= 0.88;
+
+ currentModel.position.x += shipPhysics.velocitySlideX;
+ currentModel.position.z += shipPhysics.velocitySlideZ;
+
+ shipPhysics.rotationVelocityX += (targetRotX - currentModel.rotation.x) * 0.1;
+ shipPhysics.rotationVelocityX *= 0.85;
+ currentModel.rotation.x += shipPhysics.rotationVelocityX;
+
+ shipPhysics.rotationVelocityZ += (targetRotZ - currentModel.rotation.z) * 0.1;
+ shipPhysics.rotationVelocityZ *= 0.85;
+ currentModel.rotation.z += shipPhysics.rotationVelocityZ;
+
+ if (isFileCameraActive && fileCamera) {
+ const moveSpeed = 0.08;
+ 
+ const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(fileCamera.quaternion);
+ dir.y = 0;
+ dir.normalize();
+ const sideDir = new THREE.Vector3(1, 0, 0).applyQuaternion(fileCamera.quaternion);
+ sideDir.y = 0;
+ sideDir.normalize();
+
+ const moveVector = new THREE.Vector3();
+ if (keys.w) moveVector.add(dir);
+ if (keys.s) moveVector.sub(dir);
+ if (keys.d) moveVector.add(sideDir);
+ if (keys.a) moveVector.sub(sideDir);
+ moveVector.normalize().multiplyScalar(moveSpeed);
+
+ fileCamera.position.add(moveVector);
+
+ cameraPhysics.velocityY += cameraPhysics.gravity;
+ cameraPhysics.velocityY = Math.min(cameraPhysics.velocityY, 0.3);
+ fileCamera.position.y -= cameraPhysics.velocityY;
+
+ const worldPos = new THREE.Vector3();
+ fileCamera.getWorldPosition(worldPos);
+
+ raycaster.set(worldPos, new THREE.Vector3(0, -1, 0));
+ raycaster.far = 1.688;
+
+ const intersects = raycaster.intersectObjects(colliders, true);
+ if (intersects.length > 0) {
+ const hitPoint = intersects[0].point;
+ 
+ const localHitPoint = hitPoint.clone();
+ currentModel.worldToLocal(localHitPoint);
+
+ fileCamera.position.y = localHitPoint.y + 1.688;
+ cameraPhysics.velocityY = 0;
+ }
+
+ fileCamera.rotation.order = 'YXZ';
+ fileCamera.rotation.y = cameraRotation.yaw;
+ fileCamera.rotation.x = cameraRotation.pitch;
+
+ if (playerMesh) {
+ playerMesh.position.x = fileCamera.position.x;
+ playerMesh.position.z = fileCamera.position.z;
+ playerMesh.position.y = fileCamera.position.y - 1.688;
+ playerMesh.rotation.y = cameraRotation.yaw;
+ }
+ }
+
+ if (isNavigationCameraActive && fileCamera2) {
+ fileCamera2.rotation.order = 'YXZ';
+ fileCamera2.rotation.y = cameraRotation.yaw;
+ fileCamera2.rotation.x = cameraRotation.pitch;
+ }
+ }
+
+ if (!isFileCameraActive && !isNavigationCameraActive && !activeBoatKey) {
+ controls.update();
+ }
+
+ renderer.render(scene, activeCamera);
+ }
+
+ init();
+ </script>
+</body>
+</html>
